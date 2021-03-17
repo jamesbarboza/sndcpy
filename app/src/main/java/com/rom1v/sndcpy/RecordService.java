@@ -1,5 +1,6 @@
 package com.rom1v.sndcpy;
 
+import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.Notification;
 import android.app.NotificationChannel;
@@ -16,14 +17,16 @@ import android.media.AudioPlaybackCaptureConfiguration;
 import android.media.AudioRecord;
 import android.media.projection.MediaProjection;
 import android.media.projection.MediaProjectionManager;
-import android.net.LocalServerSocket;
-import android.net.LocalSocket;
-import android.os.Handler;
 import android.os.IBinder;
-import android.os.Message;
 import android.util.Log;
 
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.Locale;
 
 public class RecordService extends Service {
 
@@ -35,15 +38,16 @@ public class RecordService extends Service {
     private static final String ACTION_STOP = "com.rom1v.sndcpy.STOP";
     private static final String EXTRA_MEDIA_PROJECTION_DATA = "mediaProjectionData";
 
-    private static final int MSG_CONNECTION_ESTABLISHED = 1;
+    private File audioCaptureDirectory;
 
-    private static final String SOCKET_NAME = "sndcpy";
+    File recordedFile;
+    FileOutputStream recordedFileStream;
 
 
     private static final int SAMPLE_RATE = 48000;
-    private static final int CHANNELS = 2;
+    //private static final int CHANNELS = 2;
+    private static final int CHANNELS = 1;
 
-    private final Handler handler = new ConnectionHandler(this);
     private MediaProjectionManager mediaProjectionManager;
     private MediaProjection mediaProjection;
     private Thread recorderThread;
@@ -83,7 +87,11 @@ public class RecordService extends Service {
         mediaProjectionManager = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
         mediaProjection = mediaProjectionManager.getMediaProjection(Activity.RESULT_OK, data);
         if (mediaProjection != null) {
-            startRecording();
+            try {
+                startRecording();
+            } catch (FileNotFoundException e) {
+                e.printStackTrace();
+            }
         } else {
             Log.w(TAG, "Failed to capture audio");
             stopSelf();
@@ -122,20 +130,12 @@ public class RecordService extends Service {
         return actionBuilder.build();
     }
 
-    private static LocalSocket connect() throws IOException {
-        LocalServerSocket localServerSocket = new LocalServerSocket(SOCKET_NAME);
-        try {
-            return localServerSocket.accept();
-        } finally {
-            localServerSocket.close();
-        }
-    }
-
     private static AudioPlaybackCaptureConfiguration createAudioPlaybackCaptureConfig(MediaProjection mediaProjection) {
         AudioPlaybackCaptureConfiguration.Builder confBuilder = new AudioPlaybackCaptureConfiguration.Builder(mediaProjection);
         confBuilder.addMatchingUsage(AudioAttributes.USAGE_MEDIA);
         confBuilder.addMatchingUsage(AudioAttributes.USAGE_GAME);
         confBuilder.addMatchingUsage(AudioAttributes.USAGE_UNKNOWN);
+        confBuilder.addMatchingUsage(AudioAttributes.USAGE_NOTIFICATION);
         return confBuilder.build();
     }
 
@@ -155,27 +155,46 @@ public class RecordService extends Service {
         return builder.build();
     }
 
-    private void startRecording() {
+    private File createAudioFile() {
+        audioCaptureDirectory = new File(getExternalFilesDir(null), "/AudioCaptures");
+        if (!audioCaptureDirectory.exists()) {
+            audioCaptureDirectory.mkdirs();
+        }
+        String timestamp = new SimpleDateFormat("dd-MM-yyyy-hh-mm-ss", Locale.US).format(new Date());
+        String filename = "Capture-" + timestamp;
+        Log.d(TAG,  "File saved at: " + audioCaptureDirectory.getAbsolutePath() );
+        return new File(audioCaptureDirectory.getAbsolutePath() + "/" + filename + ".pcm");
+    }
+
+
+    private void startRecording() throws FileNotFoundException {
         final AudioRecord recorder = createAudioRecord(mediaProjection);
+
+        recordedFile = createAudioFile();
+        recordedFileStream = new FileOutputStream(recordedFile);
 
         recorderThread = new Thread(new Runnable() {
             @Override
             public void run() {
-                try (LocalSocket socket = connect()) {
-                    handler.sendEmptyMessage(MSG_CONNECTION_ESTABLISHED);
-
+                try {
                     recorder.startRecording();
                     int BUFFER_MS = 15; // do not buffer more than BUFFER_MS milliseconds
                     byte[] buf = new byte[SAMPLE_RATE * CHANNELS * BUFFER_MS / 1000];
                     while (true) {
                         int r = recorder.read(buf, 0, buf.length);
-                        socket.getOutputStream().write(buf, 0, r);
+                        recordedFileStream.write(buf, 0, r);
                     }
+
                 } catch (IOException e) {
                     // ignore
                 } finally {
                     recorder.stop();
                     stopSelf();
+                    try {
+                        recordedFileStream.close();
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    }
                 }
             }
         });
@@ -198,27 +217,5 @@ public class RecordService extends Service {
 
     private NotificationManager getNotificationManager() {
         return (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-    }
-
-    private static final class ConnectionHandler extends Handler {
-
-        private RecordService service;
-
-        ConnectionHandler(RecordService service) {
-            this.service = service;
-        }
-
-        @Override
-        public void handleMessage(Message message) {
-            if (!service.isRunning()) {
-                // if the VPN is not running anymore, ignore obsolete events
-                return;
-            }
-
-            if (message.what == MSG_CONNECTION_ESTABLISHED) {
-                Notification notification = service.createNotification(true);
-                service.getNotificationManager().notify(NOTIFICATION_ID, notification);
-            }
-        }
     }
 }
